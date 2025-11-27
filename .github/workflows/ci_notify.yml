@@ -1,0 +1,40 @@
+name: CI & Notify (Streamlit Cloud)
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run lint (basic import test)
+        run: |
+          python - <<'PY'
+          import importlib, sys
+          try:
+              import pandas, streamlit, openpyxl
+              print("Imports OK")
+          except Exception as e:
+              print("Import failed:", e)
+              sys.exit(2)
+          PY
+  notify-streamlit:
+    needs: test-and-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Notify / Reminder to deploy on Streamlit Cloud
+        run: |
+          echo "Streamlit Cloud can auto-deploy this repo when you connect it in Streamlit Cloud UI."
+          echo "If you want fully automated deployment via Actions, configure a Streamlit Cloud API token and custom deploy steps."
