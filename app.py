@@ -1,8 +1,11 @@
 # app.py
 """
-Streamlit app: Collate Failure Summary + Failure Report into core buckets,
-with robust concatenation of report messages and explicit reshuffle of columns.
-Exports Excel with Reason columns grouped & collapsed.
+Streamlit app implementing Option B:
+- Inserts one combined core-bucket column (Compliance, Content, ...) BEFORE original check columns.
+- Keeps all original non-Reason columns in exactly their original order.
+- Puts reason messages both in the specific check column (if matched) AND concatenated in the combined bucket column.
+- Exports a 2-row header: Row1 = bucket names, Row2 = check column names.
+- Groups and collapses Reason columns at the end of the exported workbook.
 """
 import streamlit as st
 import pandas as pd
@@ -15,29 +18,22 @@ from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-# try fuzzy lib
+# optional fuzzy matching
 try:
     from rapidfuzz import process, fuzz
     RAPIDFUZZ = True
 except Exception:
     RAPIDFUZZ = False
 
-st.set_page_config(page_title="Myntra QC Collator", layout="wide")
+st.set_page_config(page_title="Myntra QC Collator (Option B)", layout="wide")
 
-# canonical core order (exact)
-CORE_ORDER = [
-    "Compliance", "Content", "Formatting", "Image Formatting",
-    "Image", "Size", "Image Sequence"
-]
-
-# fuzzy threshold if rapidfuzz present
+CORE_ORDER = ["Compliance", "Content", "Formatting", "Image Formatting", "Image", "Size", "Image Sequence"]
 DEFAULT_FUZZ = 82
 
-def normalize_title(t):
-    if t is None:
+def normalize(s):
+    if s is None:
         return ""
-    s = str(t)
-    s = s.strip()
+    s = str(s).strip()
     s = re.sub(r'[\t\r\n]+', ' ', s)
     s = re.sub(r'\s+', ' ', s)
     s = s.strip(" .:-–—")
@@ -47,79 +43,130 @@ def split_bullets(text):
     if pd.isna(text) or text is None:
         return []
     s = str(text)
-    parts = re.split(r'\n|•|◦|·|•|-{2,}|—|–', s)
+    parts = re.split(r'\n|•|◦|·|-{2,}|—|–', s)
     return [p.strip() for p in parts if p.strip()]
 
-def parse_reason_and_msg(bullet):
+def parse_title_msg(bullet):
     if not bullet:
-        return ("", "")
+        return ("","")
     parts = re.split(r'\s*[:\-—–]\s*', bullet, maxsplit=1)
-    if len(parts) == 2:
+    if len(parts)==2:
         return parts[0].strip(), parts[1].strip()
     return parts[0].strip(), ""
 
-def build_grouped_workbook(visible_df, full_df, reason_columns, mapping_used_df):
+def build_grouped_excel_2rowheader(style_col, combined_cols, original_cols, original_row_values, reason_columns, mapping_audit_df):
+    """
+    Create workbook with:
+    - Row1: bucket names (for combined cols then for each original col its bucket)
+    - Row2: column names (combined col names and original col names)
+    - Then data rows from original_row_values (list of dicts)
+    - At the end append reason columns (grouped & hidden)
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "cleaned_output"
-    # header = visible columns + reason columns (reason columns positioned after visible to be grouped)
-    all_cols = list(visible_df.columns) + reason_columns
-    ws.append(all_cols)
-    for _, row in full_df.iterrows():
-        row_vals = [row.get(c, "") for c in visible_df.columns] + [row.get(c, "") for c in reason_columns]
-        ws.append(row_vals)
-    # hide reason columns (grouped)
-    start_idx = len(visible_df.columns) + 1
-    end_idx = start_idx + len(reason_columns) - 1
-    for col_idx in range(start_idx, end_idx + 1):
-        col_letter = get_column_letter(col_idx)
-        ws.column_dimensions[col_letter].outlineLevel = 1
-        ws.column_dimensions[col_letter].hidden = True
-    # mapping_used sheet
-    ws_map = wb.create_sheet("mapping_used")
-    if mapping_used_df is None:
-        mapping_used_df = pd.DataFrame(columns=["Header","CoreBucket","NormalizedHeader","Notes"])
-    for r in dataframe_to_rows(mapping_used_df, index=False, header=True):
-        ws_map.append(r)
-    # dropped columns
-    ws_dropped = wb.create_sheet("dropped_reason_columns")
-    for c in reason_columns:
-        ws_dropped.append([c])
+
+    # Build Row1 and Row2 headers
+    row1 = []
+    row2 = []
+    # style id column(s)
+    row1.append("")  # no bucket above styleid
+    row2.append(style_col)
+
+    # combined bucket columns (one per core in CORE_ORDER) - bucket name on row1, label on row2 (we use same name as row1)
+    for core in combined_cols:
+        row1.append(core)
+        row2.append(core)  # column name same as bucket (optionally "Compliance (Combined)" if you want)
+
+    # For original columns, look up bucket label from mapping_audit_df if exists, else blank
+    col_to_bucket = {}
+    if mapping_audit_df is not None and not mapping_audit_df.empty:
+        # mapping_audit_df expected columns: Header, CoreBucket
+        for _, r in mapping_audit_df.iterrows():
+            hdr = str(r.get("Header","")).strip()
+            bucket = str(r.get("CoreBucket","")).strip()
+            col_to_bucket[hdr] = bucket
+
+    for col in original_cols:
+        bucket = col_to_bucket.get(col, "")
+        row1.append(bucket)
+        row2.append(col)
+
+    # write header rows
+    ws.append(row1)
+    ws.append(row2)
+
+    # write data rows (in same order)
+    for rd in original_row_values:
+        row = []
+        # styleid
+        row.append(rd.get(style_col,""))
+        # combined columns first
+        for core in combined_cols:
+            row.append(rd.get(f"__COMBINED__{core}", ""))
+        # then original columns
+        for col in original_cols:
+            row.append(rd.get(col, ""))
+        ws.append(row)
+
+    # Now append reason columns as separate sheet area to the right and then set them hidden (grouped)
+    # We'll add them as additional columns in the same sheet after current columns, to allow Excel grouping
+    current_col_count = len(row1)
+    # append reason headers to header rows
+    for rc in reason_columns:
+        ws.cell(row=1, column=current_col_count+1).value = ""  # top row: we leave blank or could put "Reason"
+        ws.cell(row=2, column=current_col_count+1).value = rc
+        current_col_count += 1
+
+    # fill reason values per row
+    # original_row_values are in the same order, so for each row index i (0-based) write reason values
+    for i, rd in enumerate(original_row_values):
+        excel_row_idx = 3 + i  # data starts at row 3
+        col_idx = len(row1) + 1
+        for rc in reason_columns:
+            ws.cell(row=excel_row_idx, column=col_idx).value = rd.get(rc, "")
+            col_idx += 1
+
+    # set outline level and hide reason columns so they appear collapsed (+) in Excel
+    start_reason_col = len(row1) + 1
+    end_reason_col = current_col_count
+    for cidx in range(start_reason_col, end_reason_col+1):
+        letter = get_column_letter(cidx)
+        try:
+            ws.column_dimensions[letter].outlineLevel = 1
+            ws.column_dimensions[letter].hidden = True
+        except Exception:
+            pass
+
     return wb
 
-st.title("Myntra QC — Collate & Clean (fixed reshuffle & concat)")
+# UI
+st.title("Myntra QC Collator — Option B (Combined bucket column + per-check messages)")
 
-st.markdown("""
-Upload your Output Excel. This version:
-- Ensures core-bucket columns appear first (exact order),
-- Concatenates Failure Report messages (preferred) with Failure Summary titles,
-- Exports grouped/collapsed Reason columns.
-""")
-
-uploaded_xlsx = st.file_uploader("Upload Output Excel (XLSX)", type=["xlsx"])
-c1, c2, c3 = st.columns(3)
-with c1:
-    style_col = st.text_input("styleid column name", value="styleid")
-with c2:
+uploaded = st.file_uploader("Upload Output Excel (.xlsx)", type=["xlsx"])
+col1, col2, col3 = st.columns(3)
+with col1:
+    style_col = st.text_input("styleId column name", value="styleid")
+with col2:
     summary_col = st.text_input("Failure Summary column name", value="Failure Summary")
-with c3:
+with col3:
     report_col = st.text_input("Failure Report column name", value="Failure Report")
 
-# Load mapping.xlsx bundled
-mapping_path_local = os.path.join(os.path.dirname(__file__), "mapping.xlsx")
-if not os.path.exists(mapping_path_local):
-    st.error("mapping.xlsx missing in repo. Put mapping.xlsx next to app.py")
+# load bundled mapping.xlsx
+mapping_path = os.path.join(os.path.dirname(__file__), "mapping.xlsx")
+if not os.path.exists(mapping_path):
+    st.error("mapping.xlsx missing in repo. Add mapping.xlsx and redeploy.")
     st.stop()
 
-map_df = pd.read_excel(mapping_path_local).fillna("")
-# ensure columns
+map_df = pd.read_excel(mapping_path).fillna("")
+# normalize expected columns
 if len(map_df.columns) >= 2:
     map_df = map_df.iloc[:, :2]
     map_df.columns = ["Header", "CoreBucket"]
 else:
     map_df = pd.DataFrame(columns=["Header","CoreBucket"])
 
-# editor (try modern first, fallback)
+# show editable mapping (best-effort)
 editor_df = None
 try:
     editor_df = st.data_editor(map_df, num_rows="dynamic")
@@ -127,206 +174,230 @@ except Exception:
     try:
         editor_df = st.experimental_data_editor(map_df, num_rows="dynamic")
     except Exception:
-        # fallback: show static table
-        st.write("Mapping editor not supported in this runtime. Using bundled mapping.")
+        st.write("Mapping editor not available; using bundled mapping.")
         editor_df = map_df.copy()
 
-# build mapping dict, preserving mapping order (OrderedDict of core buckets -> list of headers)
-mapping_hdr_to_bucket = {}
-ordered_headers = []
+# Build mapping dict normalized -> bucket and header name set
+mapping_norm_to_bucket = {}
+all_mapping_headers = []
 for _, r in editor_df.iterrows():
-    hdr = str(r["Header"]).strip()
-    bucket = str(r["CoreBucket"]).strip() or "Unmapped"
+    hdr = str(r.get("Header","")).strip()
+    bucket = str(r.get("CoreBucket","")).strip() or ""
     if hdr:
-        mapping_hdr_to_bucket[hdr] = bucket
-        ordered_headers.append(hdr)
+        mapping_norm_to_bucket[normalize(hdr)] = bucket
+        all_mapping_headers.append(hdr)
 
-# create normalized mapping lookup for exact & fuzzy
-norm_map = {normalize_title(h): mapping_hdr_to_bucket[h] for h in mapping_hdr_to_bucket}
-norm_keys = list(norm_map.keys())
+# Precompute normalized mapping keys list (for fuzzy)
+norm_keys = list(mapping_norm_to_bucket.keys())
 
-# fuzzy threshold control
-if RAPIDFUZZ:
-    fuzz_threshold = st.sidebar.slider("Fuzzy threshold", 60, 95, DEFAULT_FUZZ)
-else:
-    fuzz_threshold = None
-    st.sidebar.info("RapidFuzz not installed; fuzzy matching disabled. Add rapidfuzz to requirements to enable.")
-
-if uploaded_xlsx is None:
-    st.info("Upload the Output Excel to collate and clean.")
+if uploaded is None:
+    st.info("Upload your Output Excel to process.")
     st.stop()
 
-# Read workbook (first sheet)
+# Read uploaded workbook (first sheet)
 try:
-    input_book = pd.read_excel(uploaded_xlsx, sheet_name=None, dtype=str)
-    sheet_name = list(input_book.keys())[0]
-    df = input_book[sheet_name].fillna("")
+    xls = pd.read_excel(uploaded, sheet_name=None, dtype=str)
+    first_sheet_name = list(xls.keys())[0]
+    df = xls[first_sheet_name].fillna("")
 except Exception as e:
     st.error("Failed to read uploaded Excel: " + str(e))
     st.stop()
 
+# Identify reason columns (headers containing 'Reason')
 all_cols = list(df.columns)
 reason_cols = [c for c in all_cols if re.search(r'\breason\b', str(c), flags=re.IGNORECASE)]
 
-# ensure core columns exist
-for core in CORE_ORDER + ["Unmapped"]:
-    if core not in df.columns:
-        df[core] = ""
+# Build original non-reason columns in original order
+original_non_reason_cols = [c for c in all_cols if c not in reason_cols]
 
-# helper to find report message for a title
-def find_best_report_message(title, report_parsed, report_map):
-    # try normalized exact
-    n = normalize_title(title)
-    if n in report_map and report_map[n]:
-        return report_map[n][0]
-    # try substring in report_parsed messages/titles
+# We will keep all original_non_reason_cols exactly in the same order
+# We'll create combined bucket columns (one per CORE_ORDER) and place them before original columns
+
+# Build a fast lookup to match a reason title to a specific original check column name if present
+# We'll use normalized matching against original_non_reason_cols too
+orig_norm_to_col = {normalize(c): c for c in original_non_reason_cols}
+
+# function to map a reason title to a bucket:
+def map_title_to_bucket(title, fuzz_threshold=DEFAULT_FUZZ):
+    n = normalize(title)
+    # exact normalized
+    if n in mapping_norm_to_bucket and mapping_norm_to_bucket[n]:
+        return mapping_norm_to_bucket[n], "exact"
+    # substring match against mapping headers (case-insensitive)
+    for hdr in all_mapping_headers:
+        if hdr and hdr.lower() in title.lower():
+            return mapping_norm_to_bucket.get(normalize(hdr), ""), "substr_maphdr"
+    # fuzzy match if available
+    if RAPIDFUZZ and norm_keys:
+        best = process.extractOne(n, norm_keys, scorer=fuzz.token_sort_ratio)
+        if best and best[1] >= fuzz_threshold:
+            return mapping_norm_to_bucket[best[0]], f"fuzzy:{best[1]}"
+    return "", "unmapped"
+
+# We'll also try to find the original column that corresponds to a particular reason title
+def find_matching_orig_col(title, fuzz_threshold=DEFAULT_FUZZ):
+    n = normalize(title)
+    if n in orig_norm_to_col:
+        return orig_norm_to_col[n], "exact_col"
+    # try substring in original column names
+    for col in original_non_reason_cols:
+        if col and col.lower() in title.lower():
+            return col, "substr_col"
+        if title.lower() in col.lower():
+            return col, "substr_col2"
+    if RAPIDFUZZ and orig_norm_to_col:
+        best = process.extractOne(n, list(orig_norm_to_col.keys()), scorer=fuzz.token_sort_ratio)
+        if best and best[1] >= DEFAULT_FUZZ:
+            return orig_norm_to_col[best[0]], f"fuzzy_col:{best[1]}"
+    return None, "no_col"
+
+# Prepare output row container list of dicts
+output_rows = []
+mapping_audit = []  # for mapping_used sheet
+
+# For each row, parse bullets and populate combined buckets & column-specific cells
+for _, row in df.iterrows():
+    # initialize output row with original non-reason column values
+    out_row = {c: row.get(c, "") for c in original_non_reason_cols}
+    # initialize combined fields
+    for core in CORE_ORDER:
+        out_row[f"__COMBINED__{core}"] = ""
+    # parse summary and report bullets
+    summary_bullets = split_bullets(row.get(summary_col, ""))
+    report_bullets = split_bullets(row.get(report_col, ""))
+    # parse into (title,msg) lists
+    summary_parsed = [parse_title_msg(b) for b in summary_bullets]
+    report_parsed = [parse_title_msg(b) for b in report_bullets]
+    # build a report_map: normalized title -> list(messages)
+    report_map = defaultdict(list)
     for rt, rm in report_parsed:
-        hay = (rt or "") + " " + (rm or "")
-        if title and title.lower() in hay.lower():
-            return rm or ""
-    # try fuzzy match (title -> report titles) if available
-    if RAPIDFUZZ:
-        report_titles_norm = [normalize_title(rt or rm[:30]) for rt,rm in report_parsed]
-        if report_titles_norm:
-            best = process.extractOne(n, report_titles_norm, scorer=fuzz.token_sort_ratio)
-            if best and best[1] >= (fuzz_threshold or DEFAULT_FUZZ):
-                idx = report_titles_norm.index(best[0])
-                return report_parsed[idx][1] or ""
-    return ""
-
-mapped_log = []
-unmapped_set = set()
-
-# iterate rows
-for idx, row in df.iterrows():
-    summary_text = row.get(summary_col, "") if summary_col in df.columns else ""
-    report_text = row.get(report_col, "") if report_col in df.columns else ""
-
-    summary_bullets = split_bullets(summary_text)
-    report_bullets = split_bullets(report_text)
-
-    summary_parsed = [parse_reason_and_msg(b) for b in summary_bullets]
-    report_parsed = [parse_reason_and_msg(b) for b in report_bullets]
-
-    # build report_map normalized_title -> [messages]
-    report_map = {}
-    for rt, rm in report_parsed:
-        key = normalize_title(rt) if rt else normalize_title(rm[:40])
-        report_map.setdefault(key, []).append(rm or "")
-
-    core_msgs = defaultdict(list)
-
-    # process summary bullets (primary driver)
+        key = normalize(rt) if rt else normalize(rm[:40])
+        report_map[key].append(rm or "")
+    # process summary parsed bullets primarily
+    bucket_accumulator = defaultdict(list)  # bucket -> list of messages
     for title, s_msg in summary_parsed:
         if not title:
             continue
-        # pick the best message from report if available
-        rep_msg = find_best_report_message(title, report_parsed, report_map)
-        final_msg = rep_msg if rep_msg else s_msg
-        # map title -> bucket
-        n = normalize_title(title)
-        bucket = None
-        if n in norm_map:
-            bucket = norm_map[n]
-            mapped_log.append({"Title": title, "Bucket": bucket, "Method": "exact_norm"})
+        # prefer a detailed message from report if possible
+        repmsg = ""
+        key = normalize(title)
+        if key in report_map and report_map[key]:
+            repmsg = report_map[key][0]
         else:
-            # try fuzzy on mapping keys (if available)
-            if RAPIDFUZZ and norm_keys:
-                best = process.extractOne(n, norm_keys, scorer=fuzz.token_sort_ratio)
-                if best and best[1] >= (fuzz_threshold or DEFAULT_FUZZ):
-                    bucket = norm_map[best[0]]
-                    mapped_log.append({"Title": title, "Bucket": bucket, "Method": f"fuzzy({best[1]})"})
-        if not bucket:
-            # attempt substring match with mapping headers
-            found = False
-            for hdr in mapping_hdr_to_bucket.keys():
-                if hdr and hdr.lower() in title.lower():
-                    bucket = mapping_hdr_to_bucket[hdr]
-                    mapped_log.append({"Title": title, "Bucket": bucket, "Method": "substr_maphdr"})
-                    found = True
+            # try substring match in report_parsed
+            for rt, rm in report_parsed:
+                hay = (rt or "") + " " + (rm or "")
+                if title and title.lower() in hay.lower():
+                    repmsg = rm or ""
                     break
-            if not found:
-                unmapped_set.add(title)
-                bucket = "Unmapped"
-                mapped_log.append({"Title": title, "Bucket": bucket, "Method": "unmapped"})
-        core_msgs[bucket].append(f"{title}: {final_msg}".strip())
+        final_msg = repmsg if repmsg else s_msg
 
-    # handle report bullets that didn't appear in summary (extra)
+        # map title to bucket
+        bucket, method = map_title_to_bucket(title)
+        mapping_audit.append({"Title": title, "Bucket": bucket or "Unmapped", "Method": method})
+        if not bucket:
+            bucket = "Unmapped"
+        # append to combined bucket accumulator
+        bucket_accumulator[bucket].append(f"{title}: {final_msg}".strip())
+
+        # attempt to find matching original column and write message there (overwriting previous value)
+        matched_col, col_method = find_matching_orig_col(title)
+        if matched_col:
+            # put final_msg into that column's cell
+            out_row[matched_col] = f"{title}: {final_msg}"
+            mapping_audit[-1]["MatchedColumn"] = matched_col
+            mapping_audit[-1]["ColMatchMethod"] = col_method
+        else:
+            mapping_audit[-1]["MatchedColumn"] = ""
+            mapping_audit[-1]["ColMatchMethod"] = col_method
+
+    # process any report bullets not covered above
+    # (if report bullet not mapped to summary, we still map it)
     for rt, rm in report_parsed:
-        # check if message already captured
-        rep_key = normalize_title(rt) if rt else normalize_title(rm[:40])
-        already = False
-        for msgs in core_msgs.values():
-            for m in msgs:
-                if (rm and rm in m) or (rt and rt in m):
-                    already = True
-                    break
-            if already:
+        key = normalize(rt)
+        # skip if this report message already used in above mapping (we used report_map entries above)
+        # simple heuristic: if rm is empty and rt exists in summary_parsed titles, skip
+        already_handled = False
+        for t, _ in summary_parsed:
+            if normalize(t) == key:
+                already_handled = True
                 break
-        if already:
+        if already_handled:
             continue
-        # map rt to bucket similar to above
-        n = normalize_title(rt or rm[:30])
-        bucket = None
-        if n in norm_map:
-            bucket = norm_map[n]
-            mapped_log.append({"Title": rt or rm[:30], "Bucket": bucket, "Method": "exact_norm_report"})
-        else:
-            if RAPIDFUZZ and norm_keys:
-                best = process.extractOne(n, norm_keys, scorer=fuzz.token_sort_ratio)
-                if best and best[1] >= (fuzz_threshold or DEFAULT_FUZZ):
-                    bucket = norm_map[best[0]]
-                    mapped_log.append({"Title": rt or rm[:30], "Bucket": bucket, "Method": f"fuzzy_report({best[1]})"})
+        title = rt or (rm[:40] if rm else "Unknown")
+        final_msg = rm or ""
+        bucket, method = map_title_to_bucket(title)
+        mapping_audit.append({"Title": title, "Bucket": bucket or "Unmapped", "Method": f"report_{method}"})
         if not bucket:
-            # substring mapping
-            found = False
-            for hdr in mapping_hdr_to_bucket.keys():
-                if hdr and hdr.lower() in (rt or rm or "").lower():
-                    bucket = mapping_hdr_to_bucket[hdr]
-                    mapped_log.append({"Title": rt or rm[:30], "Bucket": bucket, "Method": "substr_maphdr_report"})
-                    found = True
-                    break
-            if not found:
-                bucket = "Unmapped"
-                unmapped_set.add(rt or rm[:30])
-                mapped_log.append({"Title": rt or rm[:30], "Bucket": bucket, "Method": "unmapped_report"})
-        core_msgs[bucket].append(f"{rt or rm[:30]}: {rm}".strip())
+            bucket = "Unmapped"
+        bucket_accumulator[bucket].append(f"{title}: {final_msg}")
+        matched_col, col_method = find_matching_orig_col(title)
+        if matched_col:
+            out_row[matched_col] = f"{title}: {final_msg}"
+            mapping_audit[-1]["MatchedColumn"] = matched_col
+            mapping_audit[-1]["ColMatchMethod"] = col_method
+        else:
+            mapping_audit[-1]["MatchedColumn"] = ""
+            mapping_audit[-1]["ColMatchMethod"] = col_method
 
-    # write combined strings into df core buckets
-    for core in CORE_ORDER + ["Unmapped"]:
-        if core in core_msgs and core_msgs[core]:
-            df.at[idx, core] = "\n".join(core_msgs[core])
+    # fill combined columns in out_row
+    for core in CORE_ORDER:
+        msgs = bucket_accumulator.get(core, [])
+        out_row[f"__COMBINED__{core}"] = "\n".join(msgs) if msgs else ""
 
-# final visible df: reorder columns so CORE_ORDER first (only those present), then remaining columns excluding reason columns
-present_cores = [c for c in CORE_ORDER if c in df.columns]
-other_cols = [c for c in df.columns if c not in present_cores and c not in reason_cols]
-visible_cols_ordered = present_cores + other_cols
-visible_df = df[visible_cols_ordered].copy()
+    # also store original reason columns' values (we'll keep and export them at the end)
+    for rc in reason_cols:
+        out_row[rc] = row.get(rc,"")
 
-st.success("Collation complete. Preview (first 10 rows)")
-st.dataframe(visible_df.head(10), use_container_width=True)
+    # store style col
+    out_row[style_col] = row.get(style_col, "")
 
-# mapping_used DataFrame for audit
-mapping_used_df = pd.DataFrame(mapped_log)
-if mapping_used_df.empty:
-    # produce mapping table fallback
-    mapping_used_df = pd.DataFrame([
-        {"Header": h, "CoreBucket": mapping_hdr_to_bucket[h], "NormalizedHeader": normalize_title(h)}
-        for h in mapping_hdr_to_bucket
-    ])
+    # append to output rows
+    output_rows.append(out_row)
 
-# Build grouped workbook and provide download
-wb = build_grouped_workbook(visible_df, df, reason_cols, mapping_used_df)
-bio = BytesIO()
-wb.save(bio)
-out_bytes = bio.getvalue()
+# Build final ordered lists for export
+# Combined columns first (in CORE_ORDER)
+combined_cols = CORE_ORDER.copy()
 
+# Original columns: keep original_non_reason_cols order
+original_cols = original_non_reason_cols.copy()
+
+# We'll build a mapping audit dataframe to put in the workbook for review
+mapping_audit_df = pd.DataFrame(mapping_audit)
+
+# Prepare mapping header info for row1 above original columns:
+# For each original column, find its bucket using mapping_norm_to_bucket or heuristics
+orig_col_buckets = []
+for col in original_cols:
+    n = normalize(col)
+    bucket = mapping_norm_to_bucket.get(n, "")
+    if not bucket:
+        # try substring of mapping headers
+        found = ""
+        for hdr in all_mapping_headers:
+            if hdr and hdr.lower() in col.lower():
+                found = mapping_norm_to_bucket.get(normalize(hdr), "")
+                break
+        bucket = found or ""
+    orig_col_buckets.append(bucket)
+
+# Prepare original_row_values as list of dicts in same order as output_rows
+# (already done: output_rows list)
+# Now create workbook with 2-row header and grouped reason columns
+
+wb = build_grouped_excel_2rowheader(style_col, combined_cols, original_cols, output_rows, reason_cols, editor_df)
+
+# convert to bytes
+buf = BytesIO()
+wb.save(buf)
+buf.seek(0)
+
+st.success("Prepared output — download the Excel below.")
 st.download_button(
-    "Download cleaned & grouped Excel (Reason cols collapsed)",
-    data=out_bytes,
-    file_name=f"myntra_collated_grouped_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+    "Download 2-row-header grouped workbook (Option B)",
+    data=buf.getvalue(),
+    file_name=f"myntra_qc_optionB_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-if unmapped_set:
-    st.warning(f"{len(unmapped_set)} unmapped reason titles found. See 'mapping_used' sheet in downloaded workbook for details.")
+st.info("Notes: Combined bucket columns appear after styleId (one column per core). Each original column retains its original position and name. Reason columns are appended and grouped (collapsed).")
